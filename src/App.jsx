@@ -12,6 +12,20 @@ const actFactors = [
   { key: "active", label: "活発", factor: 1.725 },
 ];
 function autoMeal() { const h = new Date().getHours(); if (h < 10) return "breakfast"; if (h < 14) return "lunch"; if (h < 20) return "dinner"; return "snack"; }
+// ===== JSONP fetch (CORS-free) =====
+function fetchJsonp(url, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const cb = "_blcb_" + Date.now();
+    const timer = setTimeout(() => { cleanup(); reject(new Error("タイムアウト")); }, timeout);
+    const cleanup = () => { clearTimeout(timer); delete window[cb]; const s = document.getElementById(cb); if (s) s.remove(); };
+    window[cb] = (data) => { cleanup(); resolve(data); };
+    const sep = url.includes("?") ? "&" : "?";
+    const s = document.createElement("script");
+    s.id = cb; s.src = url + sep + "callback=" + cb;
+    s.onerror = () => { cleanup(); reject(new Error("GAS接続エラー")); };
+    document.head.appendChild(s);
+  });
+}
 // ===== Local PFC database (API-free fallback) =====
 const FOOD_DB = [
   {k:["プロテイン","ホエイ"],u:"30g",cal:120,p:24,f:1.5,c:3},
@@ -261,22 +275,16 @@ export default function BodyTracker() {
   const [showPasteBox, setShowPasteBox] = useState(false);
   const [pasteText, setPasteText] = useState('');
 
-  const importSleepFromPaste = async (text) => {
-    if (!text.trim()) return;
-    setSleepSyncing(true); setSleepSyncResult(null);
-    try {
-      let data;
-      try { data = JSON.parse(text.trim()); } catch(e2) { throw new Error('JSONの形式が不正です'); }
-      if (!Array.isArray(data)) throw new Error('配列形式のJSONが必要です');
-
-      const normalized = data.map(r => {
-        let dateStr = String(r.date || '');
-        if (dateStr.includes('T')) {
-          const d = new Date(dateStr);
-          dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-        }
-        return {
-          date: dateStr.slice(0, 10),
+  const normalizeSleepData = (data) => {
+    if (!Array.isArray(data)) throw new Error('配列形式のJSONが必要です');
+    const normalized = data.map(r => {
+      let dateStr = String(r.date || '');
+      if (dateStr.includes('T')) {
+        const d = new Date(dateStr);
+        dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      }
+      return {
+        date: dateStr.slice(0, 10),
         bedtime: String(r.bedtime || ''),
         wakeTime: String(r.wakeTime || ''),
         totalMin: Number(r.totalMin) || 0,
@@ -287,19 +295,45 @@ export default function BodyTracker() {
         avgHr: Number(r.avgHr) || null,
         minHr: Number(r.minHr) || null,
         source: String(r.source || 'sync'),
-        };
-      }).filter(d => d.date && d.totalMin > 0);
-      if (normalized.length === 0) throw new Error('有効な睡眠データがありません');
-      const merged = [...sleep];
-      for (const remote of normalized) {
-        const idx = merged.findIndex(m => m.date === remote.date);
-        if (idx >= 0) { merged[idx] = { ...merged[idx], ...remote, id: merged[idx].id || Date.now() }; }
-        else { merged.push({ ...remote, id: Date.now() + Math.random() * 1000 }); }
-      }
-      merged.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-      await save(KEYS.sleep, merged, setSleep);
-      setSleepSyncResult({ ok: true, count: normalized.length });
-      setSleepLastSync(new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }));
+      };
+    }).filter(d => d.date && d.totalMin > 0);
+    if (normalized.length === 0) throw new Error('有効な睡眠データがありません');
+    return normalized;
+  };
+  const mergeSleepAndSave = async (normalized) => {
+    const merged = [...sleep];
+    for (const remote of normalized) {
+      const idx = merged.findIndex(m => m.date === remote.date);
+      if (idx >= 0) { merged[idx] = { ...merged[idx], ...remote, id: merged[idx].id || Date.now() }; }
+      else { merged.push({ ...remote, id: Date.now() + Math.random() * 1000 }); }
+    }
+    merged.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    await save(KEYS.sleep, merged, setSleep);
+    setSleepSyncResult({ ok: true, count: normalized.length });
+    setSleepLastSync(new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }));
+  };
+  // JSONP 1-tap auto sync
+  const syncSleepJsonp = async () => {
+    if (!settings.gasUrl) { setSleepSyncResult({ ok: false, error: "GAS URLが未設定です" }); return; }
+    setSleepSyncing(true); setSleepSyncResult(null);
+    try {
+      const data = await fetchJsonp(settings.gasUrl);
+      const normalized = normalizeSleepData(data);
+      await mergeSleepAndSave(normalized);
+    } catch (e) {
+      setSleepSyncResult({ ok: false, error: e.message });
+    }
+    setSleepSyncing(false);
+  };
+  // Paste-based import (fallback)
+  const importSleepFromPaste = async (text) => {
+    if (!text.trim()) return;
+    setSleepSyncing(true); setSleepSyncResult(null);
+    try {
+      let data;
+      try { data = JSON.parse(text.trim()); } catch(e2) { throw new Error('JSONの形式が不正です'); }
+      const normalized = normalizeSleepData(data);
+      await mergeSleepAndSave(normalized);
       setPasteText(''); setShowPasteBox(false);
     } catch (e) {
       setSleepSyncResult({ ok: false, error: e.message });
@@ -604,19 +638,25 @@ ${dataStr}
                 {sleepLastSync && <span style={{marginLeft:8,color:"#666"}}>({sleepLastSync})</span>}
               </div>
             )}
-            <button onClick={()=>setShowPasteBox(!showPasteBox)} style={{...S.btnSleep,width:"100%",marginBottom:12}}>
-              {showPasteBox ? "▲ 閉じる" : "📋 GASからデータを取り込む"}
+            {/* Main 1-tap sync button */}
+            <button onClick={syncSleepJsonp} disabled={sleepSyncing||!settings.gasUrl}
+              style={{...S.btnSleep,width:"100%",marginBottom:8,opacity:(sleepSyncing||!settings.gasUrl)?0.5:1,fontSize:15,padding:14}}>
+              {sleepSyncing ? <span style={{animation:"pulse 1s infinite"}}>⏳ 同期中...</span> : "⌚ 睡眠データを同期"}
             </button>
-            {showPasteBox && (
-              <div style={{animation:"fadeIn .3s ease",marginBottom:12}}>
-                {settings.gasUrl && (
-                  <a href={settings.gasUrl} target="_blank" rel="noopener"
-                    style={{display:"block",background:"#1a1a2e",borderRadius:8,padding:12,fontSize:11,
-                      color:mc.sleep,textDecoration:"none",marginBottom:8,wordBreak:"break-all",textAlign:"center",
-                      border:"1px solid "+mc.sleep+"30"}}>
-                    🔗 ここをクリックしてJSONを開く → ⌘A → ⌘C → ↓に貼り付け
-                  </a>
-                )}
+            {!settings.gasUrl && <p style={{fontSize:11,color:"#f87171",textAlign:"center",marginBottom:8}}>↓ まずGAS URLを設定してください</p>}
+            {/* GAS URL setting */}
+            <details style={{marginBottom:8}} open={!settings.gasUrl}>
+              <summary style={{fontSize:11,color:"#555",cursor:"pointer"}}>⚙️ GAS URL設定</summary>
+              <div style={{marginTop:8}}>
+                <input value={settings.gasUrl||""} onChange={e=>saveSettings({gasUrl:e.target.value.trim()})}
+                  placeholder="https://script.google.com/macros/s/.../exec"
+                  style={{...S.noteIn,fontSize:10,fontFamily:"monospace"}}/>
+              </div>
+            </details>
+            {/* Paste fallback */}
+            <details style={{marginBottom:8}}>
+              <summary style={{fontSize:11,color:"#555",cursor:"pointer"}}>📋 手動コピペ（JSONP非対応時）</summary>
+              <div style={{animation:"fadeIn .3s ease",marginTop:8}}>
                 <textarea
                   value={pasteText} onChange={e=>setPasteText(e.target.value)}
                   placeholder='[{"date":"2026-03-01","totalMin":334,...}]'
@@ -626,14 +666,6 @@ ${dataStr}
                   style={{...S.btnSleep,width:"100%",opacity:(!pasteText.trim()||sleepSyncing)?0.5:1}}>
                   {sleepSyncing ? "取り込み中..." : "✨ データを取り込む"}
                 </button>
-              </div>
-            )}
-            <details style={{marginBottom:8}}>
-              <summary style={{fontSize:11,color:"#555",cursor:"pointer"}}>⚙️ GAS URL設定</summary>
-              <div style={{marginTop:8}}>
-                <input value={settings.gasUrl||""} onChange={e=>saveSettings({gasUrl:e.target.value.trim()})}
-                  placeholder="https://script.google.com/macros/s/.../exec"
-                  style={{...S.noteIn,fontSize:10,fontFamily:"monospace"}}/>
               </div>
             </details>
                 {sleep.length > 0 && (() => {
